@@ -1,0 +1,35 @@
+# feature_store/feature_store.yaml
+project: fraud_detection
+registry: s3://mlops-fraud-detection/feast/registry.db
+provider: aws
+
+online_store:
+  redis:
+    host: localhost
+    port: 6379
+    timeout: 10
+
+offline_store:
+  type: parquet
+  parquet_target_path: s3://mlops-fraud-detection/feast/parquet/
+
+entity_key_datasource:
+  type: postgres
+  host: ${POSTGRES_HOST}
+  port: 5432
+  database: fraud_detection
+  schema: public
+  user: ${POSTGRES_USER}
+  password: ${POSTGRES_PASSWORD}
+
+feature_entity:
+  - name: transaction
+    join_keys:
+      - transaction_id
+
+features:
+  - name: transaction_features:amount_stats_1h
+  - name: transaction_features:velocity_24h
+  - name: transaction_features:user_risk_score
+  - name: merchant_features:fraud_rate
+  - name: user_features:account_age_days

@@ -1,0 +1,72 @@
+# load_testing/docker-compose.yml
+version: '3.8'
+
+services:
+  fastapi:
+    build: ../serving
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://fraud:password@postgres:5432/fraud_detection
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MODEL_BUCKET=mlops-fraud-detection-models
+    depends_on:
+      - postgres
+    networks:
+      - load-test-network
+
+  locust:
+    image: locustio/locust:2.18.0
+    ports:
+      - "8089:8089"
+    volumes:
+      - ./locust:/mnt/locust
+    command: -f /mnt/locust/locustfile.py --host=http://fastapi:8000
+    depends_on:
+      - fastapi
+    networks:
+      - load-test-network
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    networks:
+      - load-test-network
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    networks:
+      - load-test-network
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=fraud
+      - POSTGRES_PASSWORD=password
+      - POSTGRES_DB=fraud_detection
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    networks:
+      - load-test-network
+
+networks:
+  load-test-network:
+    driver: bridge
+
+volumes:
+  grafana-data:
+  postgres-data:
