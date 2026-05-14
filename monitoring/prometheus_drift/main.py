@@ -1,147 +1,195 @@
-# monitoring/prometheus_drift/main.py
 """
-FastAPI with Prometheus Drift Metrics
+monitoring/prometheus_drift/main.py
+FastAPI app that serves the churn prediction model,
+logs predictions to PostgreSQL, tracks feature drift
+via Prometheus gauges, and exposes a /metrics endpoint.
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from prometheus_client import Counter, Histogram, Gauge, generate_latest
-from starlette.responses import Response
-from sqlalchemy.orm import Session
-import numpy as np
+
+import pickle
+import boto3
+import io
+import time
+import statistics
+import logging
 from datetime import datetime
-import random
+from typing import List
 
-from .models import get_db, init_db
-from .drift_simulator import DriftSimulator
-
-app = FastAPI(title="Fraud Detection with Drift Monitoring")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
+from pydantic import BaseModel
+from sklearn.preprocessing import MinMaxScaler
+from sqlalchemy.orm import Session
+from prometheus_client import (
+    Counter, Histogram, Gauge, make_asgi_app, generate_latest, CONTENT_TYPE_LATEST
 )
 
-# Prometheus Drift Metrics
-FEATURE_DRIFT_GAUGE = Gauge(
-    'feature_drift_score',
-    'Feature drift score (PSI-based)',
-    ['feature_name']
-)
+from .models import SessionLocal, PredictionRecord, create_tables
 
-CONCEPT_DRIFT_GAUGE = Gauge(
-    'concept_drift_score',
-    'Concept drift score',
-    ['model_name']
-)
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-PREDICTION_DRIFT_COUNTER = Counter(
-    'prediction_drift_detected_total',
-    'Total number of drift detections',
-    ['drift_type', 'severity']
-)
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+PREDICTION_COUNT    = Counter("churn_prediction_count",    "Total churn predictions",  ["result"])
+PREDICTION_LATENCY  = Histogram("churn_prediction_latency_seconds", "Prediction latency",
+                                buckets=[0.05, 0.1, 0.2, 0.3, 0.5, 1, 2, 5])
+INPUT_FEATURE_GAUGE = Gauge("churn_input_feature",  "Input feature mean values",    ["feature_name"])
+FEATURE_DRIFT_GAUGE = Gauge("churn_feature_drift",  "Feature drift score vs baseline", ["feature_name"])
+PREDICTION_DIST     = Histogram("churn_prediction_distribution", "Prediction probability distribution",
+                                buckets=[i / 10 for i in range(11)])
 
-PREDICTION_LATENCY = Histogram(
-    'prediction_latency_seconds',
-    'Prediction latency'
-)
+# ── Baseline Statistics ───────────────────────────────────────────────────────
+BASELINE_STATS = {
+    "tenure":         {"mean": 32.4,   "std": 24.6},
+    "MonthlyCharges": {"mean": 64.8,   "std": 30.1},
+    "TotalCharges":   {"mean": 2283.3, "std": 2266.8},
+}
 
-# Initialize drift simulator
-drift_simulator = DriftSimulator()
+_cumulative: dict = {
+    f: {"values": [], "last_update": datetime.now()}
+    for f in BASELINE_STATS
+}
+
+# ── S3 / Model Config ─────────────────────────────────────────────────────────
+import os
+S3_BUCKET = os.getenv("S3_BUCKET", "customer-churn-model-bucket")
+MODEL_KEY  = os.getenv("MODEL_KEY", "model.pkl")
+SCALE_COLS = ["tenure", "MonthlyCharges", "TotalCharges"]
+
+
+class _MockModel:
+    def predict_proba(self, X):
+        n = X.shape[0]
+        p = np.random.random((n, 2))
+        return p / p.sum(axis=1, keepdims=True)
+
+
+def _load_model():
+    try:
+        s3 = boto3.client("s3")
+        obj = s3.get_object(Bucket=S3_BUCKET, Key=MODEL_KEY)
+        model = pickle.load(io.BytesIO(obj["Body"].read()))
+        logger.info("✓ Model loaded from S3")
+        return model
+    except Exception as e:
+        logger.warning(f"S3 model load failed ({e}) — using MockModel")
+        return _MockModel()
+
+
+model  = _load_model()
+scaler = MinMaxScaler()
+
+# ── Request Schema ────────────────────────────────────────────────────────────
+class CustomerFeatures(BaseModel):
+    gender: int; SeniorCitizen: int; Partner: int; Dependents: int
+    tenure: float; PhoneService: int; MultipleLines: int
+    OnlineSecurity: int; OnlineBackup: int; DeviceProtection: int
+    TechSupport: int; StreamingTV: int; StreamingMovies: int
+    PaperlessBilling: int; MonthlyCharges: float; TotalCharges: float
+    InternetService_DSL: int; InternetService_Fiber_optic: int; InternetService_No: int
+    Contract_Month_to_month: int; Contract_One_year: int; Contract_Two_year: int
+    PaymentMethod_Bank_transfer_automatic: int; PaymentMethod_Credit_card_automatic: int
+    PaymentMethod_Electronic_check: int; PaymentMethod_Mailed_check: int
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(title="Churn Prediction API with Drift Monitoring", version="1.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 @app.on_event("startup")
-async def startup_event():
-    """Initialize database on startup"""
-    init_db()
+def startup():
+    create_tables()
+    logger.info("✓ DB tables ready")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _update_drift(feature: str, value: float):
+    buf = _cumulative[feature]
+    buf["values"].append(value)
+    if len(buf["values"]) > 1000:
+        buf["values"] = buf["values"][-1000:]
+
+    now = datetime.now()
+    if (now - buf["last_update"]).total_seconds() > 60 and len(buf["values"]) > 1:
+        cur_mean = statistics.mean(buf["values"])
+        cur_std  = statistics.stdev(buf["values"])
+        baseline = BASELINE_STATS[feature]
+        mean_d   = abs(cur_mean - baseline["mean"]) / (baseline["std"] + 1e-9)
+        std_d    = abs(cur_std  - baseline["std"])  / (baseline["std"] + 1e-9)
+        drift    = (mean_d + std_d) / 2
+        FEATURE_DRIFT_GAUGE.labels(feature_name=feature).set(drift)
+        buf["last_update"] = now
+
+
+def _preprocess(data: List[CustomerFeatures]) -> np.ndarray:
+    df = pd.DataFrame([d.dict() for d in data])
+    for feature in BASELINE_STATS:
+        if feature in df.columns:
+            mean_val = df[feature].mean()
+            INPUT_FEATURE_GAUGE.labels(feature_name=feature).set(mean_val)
+            for v in df[feature].dropna():
+                _update_drift(feature, float(v))
+    df[SCALE_COLS] = scaler.fit_transform(df[SCALE_COLS])
+    return df.values
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "drift_phase": drift_simulator.current_phase
-    }
+def health():
+    return {"status": "healthy"}
+
+@app.get("/sample")
+def sample_data():
+    return [{
+        "gender": 0, "SeniorCitizen": 0, "Partner": 1, "Dependents": 0,
+        "tenure": 72.0, "PhoneService": 1, "MultipleLines": 1,
+        "OnlineSecurity": 1, "OnlineBackup": 1, "DeviceProtection": 1,
+        "TechSupport": 1, "StreamingTV": 1, "StreamingMovies": 1,
+        "PaperlessBilling": 1, "MonthlyCharges": 84.45, "TotalCharges": 6033.35,
+        "InternetService_DSL": 1, "InternetService_Fiber_optic": 0, "InternetService_No": 0,
+        "Contract_Month_to_month": 0, "Contract_One_year": 0, "Contract_Two_year": 1,
+        "PaymentMethod_Bank_transfer_automatic": 0, "PaymentMethod_Credit_card_automatic": 1,
+        "PaymentMethod_Electronic_check": 0, "PaymentMethod_Mailed_check": 0,
+    }]
 
 @app.post("/predict")
-async def predict(transaction_data: dict):
-    """Prediction endpoint with drift tracking"""
-    # Simulate prediction with current drift conditions
-    base_probability = transaction_data.get('amount', 100) / 1000
-    
-    # Apply drift adjustments
-    if drift_simulator.current_phase > 1:
-        # Feature drift effect
-        drift_factor = drift_simulator.get_feature_drift_factor()
-        base_probability *= drift_factor
-    
-    if drift_simulator.current_phase == 3:
-        # Concept drift effect
-        base_probability = min(1.0, base_probability * 1.5)
-    
-    # Add some randomness
-    probability = min(1.0, max(0.0, base_probability + random.uniform(-0.1, 0.1)))
-    is_fraud = int(probability > 0.5)
-    
-    return {
-        "transaction_id": transaction_data.get('transaction_id'),
-        "is_fraud": is_fraud,
-        "probability": round(probability, 4),
-        "drift_phase": drift_simulator.current_phase
-    }
+def predict(data: List[CustomerFeatures], db: Session = Depends(get_db)):
+    start = time.time()
+    try:
+        X    = _preprocess(data)
+        proba = model.predict_proba(X)[:, 1]
+        preds = (proba >= 0.5).astype(int)
 
-@app.get("/drift-status")
-async def drift_status():
-    """Get current drift status"""
-    return {
-        "current_phase": drift_simulator.current_phase,
-        "phase_description": drift_simulator.get_phase_description(),
-        "feature_drift_scores": drift_simulator.get_feature_drift_scores(),
-        "concept_drift_score": drift_simulator.get_concept_drift_score()
-    }
+        for i, item in enumerate(data):
+            db.add(PredictionRecord(**item.dict(), prediction=int(preds[i])))
+        db.commit()
 
-@app.post("/drift-trigger-phase")
-async def trigger_phase(phase: int):
-    """Manually trigger a drift phase (1-4)"""
-    if phase < 1 or phase > 4:
-        raise HTTPException(status_code=400, detail="Phase must be 1-4")
-    
-    drift_simulator.set_phase(phase)
-    return {"status": "success", "new_phase": phase}
+        for p in proba:
+            PREDICTION_DIST.observe(p)
+
+        churn = int(preds.sum())
+        PREDICTION_COUNT.labels(result="churn").inc(churn)
+        PREDICTION_COUNT.labels(result="non_churn").inc(len(preds) - churn)
+        PREDICTION_LATENCY.observe(time.time() - start)
+
+        return {"predictions": preds.tolist(), "probabilities": proba.tolist()}
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/drift")
+def get_drift():
+    return {f: FEATURE_DRIFT_GAUGE.labels(feature_name=f)._value.get() for f in BASELINE_STATS}
 
 @app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint"""
-    # Update drift metrics
-    for feature, score in drift_simulator.get_feature_drift_scores().items():
-        FEATURE_DRIFT_GAUGE.labels(feature_name=feature).set(score)
-    
-    CONCEPT_DRIFT_GAUGE.labels(model_name='ensemble').set(
-        drift_simulator.get_concept_drift_score()
-    )
-    
-    return Response(
-        content=generate_latest(),
-        media_type="text/plain"
-    )
-
-@app.get("/drift-history")
-async def drift_history(db: Session = Depends(get_db)):
-    """Get drift history from database"""
-    from .models import FeatureDriftRecord
-    
-    records = db.query(FeatureDriftRecord).order_by(
-        FeatureDriftRecord.recorded_at.desc()
-    ).limit(100).all()
-    
-    return [
-        {
-            "feature_name": r.feature_name,
-            "drift_score": r.drift_score,
-            "is_drifted": r.is_drifted,
-            "recorded_at": r.recorded_at.isoformat()
-        }
-        for r in records
-    ]
+def metrics():
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

@@ -1,173 +1,215 @@
-# serving/app/main.py
 """
-FastAPI Model Serving Application
+serving/app/main.py
+FastAPI inference service for the fraud detection model.
+Loads the best model from MLflow registry (or local fallback),
+validates input with Pydantic, logs predictions to PostgreSQL,
+and exposes Prometheus metrics + drift scores.
 """
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram, generate_latest
-from fastapi.middleware.cors import CORSMiddleware
-import numpy as np
-from typing import List
-import joblib
-import boto3
+
+import os
+import time
+import json
+import logging
+import statistics
 from datetime import datetime
+from typing import List, Optional
 
-from .schemas import PredictionRequest, BatchPredictionRequest, PredictionResponse
-from .model_loader import ModelLoader
-from .models import PredictionRecord
+import numpy as np
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
+from prometheus_client import (
+    Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
+)
 
-app = FastAPI(title="Fraud Detection API", version="1.0.0")
+from .schemas import FraudInput, FraudPrediction, BatchFraudInput, BatchFraudPrediction
+from .models import SessionLocal, PredictionRecord, create_tables
+from .model_loader import load_model
 
-# CORS middleware
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Prometheus Metrics ────────────────────────────────────────────────────────
+PREDICTION_COUNT    = Counter("fraud_predictions_total",         "Total predictions",         ["result"])
+PREDICTION_LATENCY  = Histogram("fraud_prediction_latency_seconds", "Prediction latency",
+                                buckets=[0.05, 0.1, 0.2, 0.5, 1, 2, 5])
+BATCH_SIZE_HIST     = Histogram("fraud_batch_size",              "Batch prediction size")
+FEATURE_DRIFT_GAUGE = Gauge("fraud_feature_drift",               "Feature drift score", ["feature_name"])
+ACTIVE_REQUESTS     = Gauge("fraud_active_requests",             "In-flight requests")
+ERROR_COUNTER       = Counter("fraud_prediction_errors_total",   "Prediction errors",   ["error_type"])
+
+# Baseline stats (from training data distribution)
+BASELINE_STATS = {
+    "TransactionAmt": {"mean": 134.5,  "std": 215.0},
+    "C1":             {"mean": 1.0,    "std": 1.5},
+    "D1":             {"mean": 200.0,  "std": 150.0},
+}
+_feature_buffers = {f: {"values": [], "last_update": datetime.now()} for f in BASELINE_STATS}
+
+# ── App ───────────────────────────────────────────────────────────────────────
+app = FastAPI(
+    title="Fraud Detection API",
+    description="Real-time fraud prediction service with drift monitoring",
+    version="1.0.0",
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=["*"], allow_credentials=True,
+    allow_methods=["*"], allow_headers=["*"],
 )
 
-# Prometheus metrics
-REQUEST_COUNT = Counter(
-    'fraud_prediction_requests_total',
-    'Total number of fraud prediction requests',
-    ['model', 'status']
-)
+# ── Model (loaded at startup) ─────────────────────────────────────────────────
+model = None
 
-REQUEST_LATENCY = Histogram(
-    'fraud_prediction_latency_seconds',
-    'Prediction latency in seconds',
-    ['model']
-)
-
-# Initialize model loader
-model_loader = ModelLoader()
 
 @app.on_event("startup")
-async def startup_event():
-    """Load models on startup"""
-    model_loader.load_models()
+def startup_event():
+    global model
+    logger.info("Loading model...")
+    model = load_model()
+    logger.info("Creating DB tables...")
+    create_tables()
+    logger.info("✓ Startup complete")
+
+
+# ── DB dependency ─────────────────────────────────────────────────────────────
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# ── Drift helpers ─────────────────────────────────────────────────────────────
+def _update_drift(feature: str, value: float):
+    buf = _feature_buffers[feature]
+    buf["values"].append(value)
+    if len(buf["values"]) > 500:
+        buf["values"] = buf["values"][-500:]
+
+    now = datetime.now()
+    if (now - buf["last_update"]).total_seconds() > 60 and len(buf["values"]) > 1:
+        cur_mean = statistics.mean(buf["values"])
+        cur_std  = statistics.stdev(buf["values"])
+        baseline = BASELINE_STATS[feature]
+        drift    = (abs(cur_mean - baseline["mean"]) / (baseline["std"] + 1e-9) +
+                    abs(cur_std  - baseline["std"])  / (baseline["std"] + 1e-9)) / 2
+        FEATURE_DRIFT_GAUGE.labels(feature_name=feature).set(round(drift, 4))
+        buf["last_update"] = now
+
+
+def _track_features(df: pd.DataFrame):
+    for feature in BASELINE_STATS:
+        if feature in df.columns:
+            for val in df[feature].dropna():
+                _update_drift(feature, float(val))
+
+
+# ── Endpoints ─────────────────────────────────────────────────────────────────
+
+@app.get("/")
+def root():
+    return {"message": "Fraud Detection API", "docs": "/docs", "metrics": "/metrics"}
+
 
 @app.get("/health")
-async def health_check():
-    """Health check endpoint"""
-    return {
-        "status": "healthy",
-        "timestamp": datetime.utcnow().isoformat(),
-        "models_loaded": list(model_loader.models.keys())
-    }
+def health():
+    return {"status": "healthy", "service": "fraud-detection-api", "model_loaded": model is not None}
 
-@app.post("/predict", response_model=PredictionResponse)
-async def predict(request: PredictionRequest):
-    """Single transaction prediction"""
-    start_time = datetime.utcnow()
-    
+
+@app.post("/predict", response_model=FraudPrediction)
+def predict(payload: FraudInput, db: Session = Depends(get_db)):
+    """Single transaction fraud prediction."""
+    ACTIVE_REQUESTS.inc()
+    start = time.time()
     try:
-        # Prepare features
-        features = np.array([[
-            request.amount,
-            request.time_since_last_transaction,
-            request.transaction_velocity,
-            request.user_risk_score,
-            request.account_age_days,
-            request.merchant_fraud_rate
-        ]])
-        
-        # Get predictions from all models
-        predictions = {}
-        probabilities = {}
-        
-        for model_name, model_info in model_loader.models.items():
-            model = model_info['model']
-            
-            if model_name == 'xgboost':
-                prob = model.predict_proba(features)[0][1]
-            elif model_name == 'lightgbm':
-                prob = model.predict(features)[0]
-            elif model_name == 'isolation_forest':
-                # Anomaly score: lower = more anomalous
-                score = model.decision_function(features)[0]
-                prob = 1 / (1 + np.exp(score))  # Convert to probability-like
-            else:
-                prob = 0.5
-            
-            predictions[model_name] = int(prob > 0.5)
-            probabilities[model_name] = float(prob)
-        
-        # Ensemble prediction (weighted average)
-        ensemble_prob = (
-            0.4 * probabilities.get('xgboost', 0.5) +
-            0.4 * probabilities.get('lightgbm', 0.5) +
-            0.2 * probabilities.get('isolation_forest', 0.5)
-        )
-        ensemble_prediction = int(ensemble_prob > 0.5)
-        
-        # Record metrics
-        latency = (datetime.utcnow() - start_time).total_seconds()
-        REQUEST_LATENCY.labels(model='ensemble').observe(latency)
-        REQUEST_COUNT.labels(model='ensemble', status='success').inc()
-        
-        return PredictionResponse(
-            transaction_id=request.transaction_id,
-            is_fraud=ensemble_prediction,
-            fraud_probability=ensemble_prob,
-            individual_predictions=predictions,
-            individual_probabilities=probabilities
-        )
-    
+        df = pd.DataFrame([payload.dict()])
+        _track_features(df)
+
+        features = df.select_dtypes(include=[np.number]).fillna(0).values
+        prob     = float(model.predict_proba(features)[0][1])
+        label    = int(prob >= 0.5)
+
+        PREDICTION_COUNT.labels(result="fraud" if label else "non_fraud").inc()
+        PREDICTION_LATENCY.observe(time.time() - start)
+
+        # Persist to PostgreSQL
+        record = PredictionRecord(**payload.dict(), prediction=label, probability=prob)
+        db.add(record)
+        db.commit()
+
+        return FraudPrediction(prediction=label, probability=prob, model_version="1.0.0")
+
     except Exception as e:
-        REQUEST_COUNT.labels(model='ensemble', status='error').inc()
+        ERROR_COUNTER.labels(error_type=type(e).__name__).inc()
+        db.rollback()
+        logger.error(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        ACTIVE_REQUESTS.dec()
 
-@app.post("/batch-predict")
-async def batch_predict(request: BatchPredictionRequest):
-    """Batch transaction prediction"""
-    start_time = datetime.utcnow()
-    
+
+@app.post("/batch-predict", response_model=BatchFraudPrediction)
+def batch_predict(payload: BatchFraudInput, db: Session = Depends(get_db)):
+    """Batch fraud predictions."""
+    ACTIVE_REQUESTS.inc()
+    start = time.time()
     try:
+        df = pd.DataFrame([r.dict() for r in payload.transactions])
+        _track_features(df)
+        BATCH_SIZE_HIST.observe(len(df))
+
+        features = df.select_dtypes(include=[np.number]).fillna(0).values
+        probs    = model.predict_proba(features)[:, 1]
+        labels   = (probs >= 0.5).astype(int)
+
         results = []
-        
-        for transaction in request.transactions:
-            # Create prediction request for each transaction
-            pred_request = PredictionRequest(
-                transaction_id=transaction.transaction_id,
-                amount=transaction.amount,
-                time_since_last_transaction=transaction.time_since_last_transaction,
-                transaction_velocity=transaction.transaction_velocity,
-                user_risk_score=transaction.user_risk_score,
-                account_age_days=transaction.account_age_days,
-                merchant_fraud_rate=transaction.merchant_fraud_rate
-            )
-            
-            # Single prediction
-            pred_response = await predict(pred_request)
-            results.append(pred_response)
-        
-        latency = (datetime.utcnow() - start_time).total_seconds()
-        REQUEST_LATENCY.labels(model='batch').observe(latency)
-        
-        return {
-            "predictions": results,
-            "count": len(results),
-            "processing_time_seconds": latency
-        }
-    
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        for i, (label, prob) in enumerate(zip(labels, probs)):
+            results.append(FraudPrediction(prediction=int(label), probability=float(prob), model_version="1.0.0"))
+            record = PredictionRecord(**payload.transactions[i].dict(), prediction=int(label), probability=float(prob))
+            db.add(record)
 
-@app.get("/metrics")
-async def metrics():
-    """Prometheus metrics endpoint"""
-    return Response(
-        content=generate_latest(),
-        media_type="text/plain"
-    )
+        db.commit()
+        PREDICTION_LATENCY.observe(time.time() - start)
+
+        return BatchFraudPrediction(predictions=results, count=len(results))
+
+    except Exception as e:
+        ERROR_COUNTER.labels(error_type=type(e).__name__).inc()
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        ACTIVE_REQUESTS.dec()
+
+
+@app.get("/drift")
+def get_drift():
+    """Return current feature drift scores."""
+    scores = {}
+    for feature in BASELINE_STATS:
+        try:
+            scores[feature] = FEATURE_DRIFT_GAUGE.labels(feature_name=feature)._value.get()
+        except Exception:
+            scores[feature] = 0.0
+    return scores
+
 
 @app.get("/model-info")
-async def model_info():
-    """Get information about loaded models"""
+def model_info():
     return {
-        "models": model_loader.model_info(),
-        "last_updated": model_loader.last_updated.isoformat() if model_loader.last_updated else None
+        "model_version": "1.0.0",
+        "model_type": "XGBoost / LightGBM / IsolationForest (best by F1)",
+        "features_expected": "numeric fraud detection features",
+        "endpoints": ["/predict", "/batch-predict", "/drift", "/health", "/metrics"],
     }
+
+
+@app.get("/metrics")
+def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)

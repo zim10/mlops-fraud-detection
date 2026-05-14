@@ -1,145 +1,125 @@
-# serving/app/model_loader.py
 """
-Model Loader - Load models from S3 or MLflow Registry
+serving/app/model_loader.py
+Loads the best fraud detection model.
+Priority order:
+  1. MLflow Model Registry (Production stage)
+  2. Local model files (xgboost → lightgbm → isolation forest)
+  3. Dummy model (for testing / cold start)
 """
-import joblib
-import boto3
-import mlflow
-from datetime import datetime
-from typing import Dict, Any
-import os
 
-class ModelLoader:
-    """Load and manage fraud detection models"""
-    
-    def __init__(self):
-        self.models: Dict[str, Dict[str, Any]] = {}
-        self.last_updated: datetime = None
-        self.s3_bucket = os.getenv('MODEL_BUCKET', 'mlops-fraud-detection-models')
-        self.mlflow_tracking_uri = os.getenv('MLFLOW_TRACKING_URI', 'http://localhost:5000')
-    
-    def load_models(self):
-        """Load all models from S3 or MLflow"""
-        mlflow.set_tracking_uri(self.mlflow_tracking_uri)
-        
-        # Load XGBoost model
-        self._load_xgboost()
-        
-        # Load LightGBM model
-        self._load_lightgbm()
-        
-        # Load Isolation Forest model
-        self._load_isolation_forest()
-        
-        self.last_updated = datetime.utcnow()
-    
-    def _load_xgboost(self):
-        """Load XGBoost model"""
-        try:
-            # Try MLflow first
-            model_uri = "models:/fraud-xgboost/production"
-            model = mlflow.xgboost.load_model(model_uri)
-            self.models['xgboost'] = {
-                'model': model,
-                'source': 'mlflow',
-                'type': 'xgboost'
-            }
-        except Exception as e:
-            print(f"MLflow load failed for XGBoost: {e}")
-            # Fallback to local file
-            try:
-                self.models['xgboost'] = {
-                    'model': joblib.load('/models/xgboost_fraud_model.json'),
-                    'source': 'local',
-                    'type': 'xgboost'
-                }
-            except Exception as e2:
-                print(f"Local load also failed: {e2}")
-                # Fallback to S3
-                self._load_from_s3('xgboost', 'xgboost_fraud_model.json')
-    
-    def _load_lightgbm(self):
-        """Load LightGBM model"""
-        try:
-            model_uri = "models:/fraud-lightgbm/production"
-            model = mlflow.lightgbm.load_model(model_uri)
-            self.models['lightgbm'] = {
-                'model': model,
-                'source': 'mlflow',
-                'type': 'lightgbm'
-            }
-        except Exception as e:
-            print(f"MLflow load failed for LightGBM: {e}")
-            try:
-                import lightgbm as lgb
-                self.models['lightgbm'] = {
-                    'model': lgb.Booster(model_file='/models/lightgbm_fraud_model.txt'),
-                    'source': 'local',
-                    'type': 'lightgbm'
-                }
-            except Exception as e2:
-                print(f"Local load also failed: {e2}")
-                self._load_from_s3('lightgbm', 'lightgbm_fraud_model.txt')
-    
-    def _load_isolation_forest(self):
-        """Load Isolation Forest model"""
-        try:
-            model_uri = "models:/fraud-isolation-forest/production"
-            model = mlflow.sklearn.load_model(model_uri)
-            self.models['isolation_forest'] = {
-                'model': model,
-                'source': 'mlflow',
-                'type': 'isolation_forest'
-            }
-        except Exception as e:
-            print(f"MLflow load failed for Isolation Forest: {e}")
-            try:
-                self.models['isolation_forest'] = {
-                    'model': joblib.load('/models/isolation_forest_model.pkl'),
-                    'source': 'local',
-                    'type': 'isolation_forest'
-                }
-            except Exception as e2:
-                print(f"Local load also failed: {e2}")
-                self._load_from_s3('isolation_forest', 'isolation_forest_model.pkl')
-    
-    def _load_from_s3(self, model_name: str, file_name: str):
-        """Load model from S3"""
-        s3_client = boto3.client('s3')
-        
-        try:
-            local_path = f'/tmp/{file_name}'
-            s3_client.download_file(
-                self.s3_bucket,
-                f'models/{file_name}',
-                local_path
+import os
+import pickle
+import logging
+import numpy as np
+
+logger = logging.getLogger(__name__)
+
+MLFLOW_TRACKING_URI = os.getenv("MLFLOW_TRACKING_URI", "http://localhost:5000")
+MODEL_DIR           = os.getenv("MODEL_DIR", "/opt/airflow/fraud_detection_pipeline/models")
+
+
+class _DummyModel:
+    """Fallback model — returns random probabilities. Replace in production."""
+    def predict_proba(self, X):
+        n = X.shape[0]
+        probs = np.random.dirichlet(np.ones(2), size=n)
+        return probs
+
+    def predict(self, X):
+        return (self.predict_proba(X)[:, 1] >= 0.5).astype(int)
+
+
+def _load_from_mlflow():
+    """Attempt to load the Production model from MLflow registry."""
+    try:
+        import mlflow
+        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+        client = mlflow.tracking.MlflowClient()
+
+        # Try each experiment in preference order
+        for experiment_name in [
+            "fraud_detection_xgboost",
+            "fraud_detection_lightgbm",
+            "fraud_detection_isolation_forest",
+        ]:
+            exp = client.get_experiment_by_name(experiment_name)
+            if not exp:
+                continue
+
+            runs = client.search_runs(
+                experiment_ids=[exp.experiment_id],
+                order_by=["metrics.f1_score DESC"],
+                max_results=1,
             )
-            
-            if file_name.endswith('.pkl'):
-                model = joblib.load(local_path)
-            else:
-                model = joblib.load(local_path)
-            
-            self.models[model_name] = {
-                'model': model,
-                'source': 's3',
-                'type': model_name
-            }
+            if not runs:
+                continue
+
+            best_run = runs[0]
+            model_uri = f"runs:/{best_run.info.run_id}/model"
+            model = mlflow.pyfunc.load_model(model_uri)
+            logger.info(f"✓ Model loaded from MLflow — experiment: {experiment_name}")
+            return model
+
+    except Exception as e:
+        logger.warning(f"MLflow model load failed: {e}")
+    return None
+
+
+def _load_from_local():
+    """Attempt to load a model from local files."""
+    candidates = [
+        ("xgboost",          os.path.join(MODEL_DIR, "xgboost_fraud_model.json")),
+        ("lightgbm",         os.path.join(MODEL_DIR, "lightgbm_fraud_model.txt")),
+        ("isolation_forest", os.path.join(MODEL_DIR, "isolation_forest_model.pkl")),
+    ]
+
+    for name, path in candidates:
+        if not os.path.exists(path):
+            continue
+        try:
+            if name == "xgboost":
+                import xgboost as xgb
+                model = xgb.XGBClassifier()
+                model.load_model(path)
+                logger.info(f"✓ XGBoost model loaded from {path}")
+                return model
+
+            elif name == "lightgbm":
+                import lightgbm as lgb
+                model = lgb.Booster(model_file=path)
+                # Wrap booster so it has predict_proba
+                class _LGBWrapper:
+                    def __init__(self, booster):
+                        self._b = booster
+                    def predict_proba(self, X):
+                        p = self._b.predict(X)
+                        return np.column_stack([1 - p, p])
+                    def predict(self, X):
+                        return (self._b.predict(X) >= 0.5).astype(int)
+                logger.info(f"✓ LightGBM model loaded from {path}")
+                return _LGBWrapper(model)
+
+            elif name == "isolation_forest":
+                with open(path, "rb") as f:
+                    model = pickle.load(f)
+                logger.info(f"✓ IsolationForest model loaded from {path}")
+                return model
+
         except Exception as e:
-            print(f"S3 load failed for {model_name}: {e}")
-    
-    def model_info(self) -> Dict[str, Any]:
-        """Get information about loaded models"""
-        return {
-            name: {
-                'source': info['source'],
-                'type': info['type'],
-                'loaded': True
-            }
-            for name, info in self.models.items()
-        }
-    
-    def reload_models(self):
-        """Reload all models"""
-        self.models = {}
-        self.load_models()
+            logger.warning(f"Failed to load {name} from {path}: {e}")
+
+    return None
+
+
+def load_model():
+    """Load model with fallback chain: MLflow → local files → dummy."""
+    model = _load_from_mlflow()
+    if model:
+        return model
+
+    model = _load_from_local()
+    if model:
+        return model
+
+    logger.warning("⚠️  Using DummyModel — no trained model found!")
+    return _DummyModel()

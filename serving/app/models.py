@@ -1,61 +1,62 @@
-# serving/app/models.py
 """
-SQLAlchemy Database Models
+serving/app/models.py
+SQLAlchemy ORM model for logging predictions to PostgreSQL.
+Each row represents one fraud prediction request.
 """
-from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+
+from sqlalchemy import create_engine, Column, Integer, Float, DateTime, String
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
 import os
 
-Base = declarative_base()
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://my_user:my_password@postgres:5432/my_db"
+)
+
+engine       = create_engine(DATABASE_URL)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base         = declarative_base()
+
 
 class PredictionRecord(Base):
-    """Store prediction records for monitoring"""
-    __tablename__ = 'prediction_records'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    transaction_id = Column(String(50), unique=True, nullable=False, index=True)
-    amount = Column(Float, nullable=False)
-    is_fraud = Column(Boolean, nullable=False)
-    fraud_probability = Column(Float, nullable=False)
-    xgboost_prob = Column(Float)
-    lightgbm_prob = Column(Float)
-    isolation_forest_score = Column(Float)
-    model_version = Column(String(20))
-    created_at = Column(DateTime, default=datetime.utcnow, index=True)
-    
-    def __repr__(self):
-        return f"<PredictionRecord(transaction_id={self.transaction_id}, is_fraud={self.is_fraud})>"
+    __tablename__ = "fraud_predictions"
 
-class FeatureDriftRecord(Base):
-    """Store feature drift metrics"""
-    __tablename__ = 'feature_drift_records'
-    
-    id = Column(Integer, primary_key=True, autoincrement=True)
-    feature_name = Column(String(100), nullable=False, index=True)
-    drift_score = Column(Float, nullable=False)
-    p_value = Column(Float)
-    psi_value = Column(Float)
-    is_drifted = Column(Boolean, default=False)
-    recorded_at = Column(DateTime, default=datetime.utcnow, index=True)
+    id             = Column(Integer, primary_key=True, index=True)
+    TransactionAmt = Column(Float,   nullable=True)
+    card1          = Column(Integer, nullable=True)
+    card2          = Column(Float,   nullable=True)
+    card3          = Column(Float,   nullable=True)
+    card5          = Column(Float,   nullable=True)
+    addr1          = Column(Float,   nullable=True)
+    addr2          = Column(Float,   nullable=True)
+    dist1          = Column(Float,   nullable=True)
+    dist2          = Column(Float,   nullable=True)
+    C1             = Column(Float,   nullable=True)
+    C2             = Column(Float,   nullable=True)
+    C3             = Column(Float,   nullable=True)
+    C4             = Column(Float,   nullable=True)
+    C5             = Column(Float,   nullable=True)
+    C6             = Column(Float,   nullable=True)
+    C7             = Column(Float,   nullable=True)
+    C8             = Column(Float,   nullable=True)
+    C9             = Column(Float,   nullable=True)
+    C10            = Column(Float,   nullable=True)
+    C11            = Column(Float,   nullable=True)
+    C12            = Column(Float,   nullable=True)
+    C13            = Column(Float,   nullable=True)
+    C14            = Column(Float,   nullable=True)
+    D1             = Column(Float,   nullable=True)
+    D2             = Column(Float,   nullable=True)
+    D3             = Column(Float,   nullable=True)
+    D4             = Column(Float,   nullable=True)
+    D5             = Column(Float,   nullable=True)
+    prediction     = Column(Integer, nullable=False)
+    probability    = Column(Float,   nullable=False)
+    model_version  = Column(String,  default="1.0.0")
+    created_at     = Column(DateTime, default=datetime.utcnow)
 
-def get_engine():
-    """Create database engine"""
-    db_url = os.getenv('DATABASE_URL', 'postgresql://user:pass@localhost:5432/fraud_detection')
-    return create_engine(db_url)
 
-def init_db():
-    """Initialize database tables"""
-    engine = get_engine()
-    Base.metadata.create_all(engine)
-    
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=get_engine())
-
-def get_db():
-    """Get database session"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
+def create_tables():
+    Base.metadata.create_all(bind=engine)
