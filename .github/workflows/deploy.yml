@@ -1,37 +1,18 @@
 # .github/workflows/deploy.yml
-name: Deploy
+name: Deploy MLOps Pipeline
 
 on:
-  workflow_run:
-    workflows: ["Train Models"]
-    types: [completed]
-    branches: [main]
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: ap-southeast-1
+  PULUMI_STACK: <your-pulumi-username>/mlops-pipeline/sandbox
 
 jobs:
-  deploy:
-    runs-on: ubuntu-latest
-    if: workflow_run.conclusion == 'success'
-    
-    steps:
-      - uses: actions/checkout@v3
-      
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: us-east-1
-          
-      - name: Build Docker image
-        run: |
-          docker build -t fraud-detection-api:${{ github.sha }} ./serving
-          docker tag fraud-detection-api:${{ github.sha }} fraud-detection-api:latest
-          
-      - name: Push to ECR
-        run: |
-          aws ecr get-login-password | docker login --username AWS --password-stdin ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com
-          docker push ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.us-east-1.amazonaws.com/fraud-detection-api:latest
-          
-      - name: Deploy to ECS
-        run: |
-          aws ecs update-service --cluster fraud-detection --service fraud-api --force-new-deployment
+  test: ...
+  deploy-infrastructure: ...
+  build-and-push: ...
+  deploy-services: ...

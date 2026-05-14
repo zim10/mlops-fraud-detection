@@ -1,11 +1,10 @@
 # monitoring/prometheus_drift/prometheus.yml
 global:
   scrape_interval: 15s
-  evaluation_interval: 15s
 
 scrape_configs:
-  - job_name: 'fraud-detection-drift'
-    static_configs:
-      - targets: ['api:8000']
-    metrics_path: '/metrics'
+  - job_name: 'churn-api'
     scrape_interval: 5s
+    static_configs:
+      - targets: ['churn-api:8000']
+    metrics_path: /metrics

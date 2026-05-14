@@ -1,0 +1,3 @@
+name: mlops-pipeline
+runtime: python
+description: MLOps CI/CD Pipeline Infrastructure
